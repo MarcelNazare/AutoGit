@@ -1,59 +1,78 @@
-# ── Toolchain ────────────────────────────────────────────────────────
+# ── Toolchain (always gcc) ───────────────────────────────────────────
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O2 -std=c11
 LDFLAGS :=
 
-# ── Platform bits ────────────────────────────────────────────────────
+# ── Platform ─────────────────────────────────────────────────────────
 ifeq ($(OS),Windows_NT)
-  EXE := .exe
-  RM  := del /Q
-  RUN :=
+  SHELL       := cmd.exe
+  .SHELLFLAGS := /c
+  EXE         := .exe
+  WIN         := 1
 else
-  EXE :=
-  RM  := rm -f
-  RUN := ./
+  EXE         :=
 endif
 
-PREFIX  ?= /usr/local
-BINDIR  ?= $(PREFIX)/bin
+# ── Paths ────────────────────────────────────────────────────────────
+BUILD  := build
+TARGET := $(BUILD)/autogit$(EXE)
+SRC    := autogit.c
 
-TARGET  := autogit$(EXE)
-SRC     := autogit.c
-OBJ     := autogit.o
+# ── Per-platform command fragments ───────────────────────────────────
+ifeq ($(WIN),1)
+  winpath = $(subst /,\,$1)
+  MKDIR_B = if not exist "$(call winpath,$(BUILD))" mkdir "$(call winpath,$(BUILD))"
+  CLEAN_B = if exist "$(call winpath,$(BUILD))" rmdir /S /Q "$(call winpath,$(BUILD))"
+  RUN_BIN = .\$(call winpath,$(TARGET))
+  CHECK_GCC = where gcc >NUL 2>&1 || (echo ERROR: gcc not found in PATH. Install MinGW-w64. & exit /B 1)
+else
+  MKDIR_B = mkdir -p "$(BUILD)"
+  CLEAN_B = rm -rf "$(BUILD)"
+  RUN_BIN = ./$(TARGET)
+  CHECK_GCC = command -v gcc >/dev/null 2>&1 || { echo "ERROR: gcc not found in PATH."; exit 1; }
+endif
 
-.PHONY: all run clean install uninstall test
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+
+.DEFAULT_GOAL := all
+.PHONY: all check build run test clean install uninstall
 
 # ── Build ────────────────────────────────────────────────────────────
-all: $(TARGET)
+all: check $(TARGET)
 
-$(TARGET): $(OBJ)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+check:
+	@$(CHECK_GCC)
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+build: all
+
+# Single-shot compile+link — same as `gcc ... -o build/autogit.exe autogit.c`
+$(TARGET): $(SRC)
+	@$(MKDIR_B)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 # ── Run ──────────────────────────────────────────────────────────────
 run: $(TARGET)
-	$(RUN)$(TARGET)
+	$(RUN_BIN) $(ARGS)
 
 test: $(TARGET)
-	$(RUN)$(TARGET) -h
+	$(RUN_BIN) -h
 
-# ── Housekeeping ─────────────────────────────────────────────────────
+# ── Clean ────────────────────────────────────────────────────────────
 clean:
-	-$(RM) $(TARGET) $(OBJ)
+	@$(CLEAN_B)
 
 # ── Install ──────────────────────────────────────────────────────────
-ifeq ($(OS),Windows_NT)
-install:
-	@echo Copy $(TARGET) into any folder on PATH, e.g.:
-	@echo   copy $(TARGET) "%USERPROFILE%\\bin\\"
+ifeq ($(WIN),1)
+install: $(TARGET)
+	@echo Copy $(call winpath,$(TARGET)) into a folder on PATH, e.g.:
+	@echo   copy "$(call winpath,$(TARGET))" "%USERPROFILE%\\bin\\autogit.exe"
 uninstall:
-	@echo Windows: just delete $(TARGET) from wherever you copied it.
+	@echo Windows: just delete autogit.exe from wherever you copied it.
 else
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/autogit
 uninstall:
-	$(RM) $(DESTDIR)$(BINDIR)/$(TARGET)
+	rm -f $(DESTDIR)$(BINDIR)/autogit
 endif

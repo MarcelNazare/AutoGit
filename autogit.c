@@ -1,5 +1,16 @@
-/* ── Platform layer ───────────────────────────────────────────────── */
-#ifdef _WIN32
+/* ── Platform layer ───────────────────────────────────────────────── *
+ * __MSYS__ is defined by MSYS gcc, whose system()/popen() shell out  *
+ * to sh.exe — so we must use POSIX redirects even on Windows.        *
+ * MinGW-w64 gcc (the desired toolchain) uses cmd.exe, so it wants    *
+ * the NUL device.                                                     */
+#if defined(__MSYS__)
+#  include <unistd.h>
+#  include <sys/stat.h>
+#  define AG_GETPID  getpid
+#  define R_NULL     " > /dev/null 2>&1"
+#  define R_ERR      " 2>/dev/null"
+#  define PATHSEP    "/"
+#elif defined(_WIN32)
 #  include <process.h>
 #  define AG_GETPID  _getpid
 #  define R_NULL     " >NUL 2>&1"
@@ -58,7 +69,7 @@ static int prompt(const char *label, char *buf, size_t bufsz) {
 static const char *config_path(void) {
     static char path[AG_PATH];
     const char *home = getenv("HOME");
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__MSYS__)
     if (!home) home = getenv("USERPROFILE");
 #endif
     if (!home) home = ".";
@@ -126,7 +137,7 @@ static int load_env(const char *root, const char *key, char *out, size_t outsz) 
 }
 
 /* ── URL finalization ─────────────────────────────────────────────── *
- * If `base` already ends in ".git", copy as-is.                      *
+ * If base ends in ".git", copy as-is.                                *
  * Otherwise strip trailing slashes and append "/<proj>.git".         */
 static void finalize_url(const char *base, const char *proj,
                          char *out, size_t outsz) {
@@ -159,15 +170,15 @@ static void project_name(const char *root, char *out, size_t outsz) {
     if (n > 4 && !strcmp(out + n - 4, ".git")) out[n - 4] = 0;
 }
 
-/* ── Portable temp file (replaces mkstemp) ────────────────────────── */
+/* ── Portable temp file ───────────────────────────────────────────── */
 static int make_temp(char *out, size_t outsz) {
     const char *dir = getenv("TMPDIR");
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__MSYS__)
     if (!dir) dir = getenv("TEMP");
     if (!dir) dir = getenv("TMP");
 #endif
     if (!dir || !dir[0]) {
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__MSYS__)
         dir = ".";
 #else
         dir = "/tmp";
@@ -274,7 +285,7 @@ int main(int argc, char *argv[]) {
 
     int added_remote = 0;
 
-    /* Read .env URL (if any) and expand it with the project name */
+    /* .env URL (if any), finalized with project name */
     char env_url_raw[AG_PATH] = {0};
     char env_url[AG_PATH]     = {0};
     int have_env_url = load_env(root, "GIT_REMOTE_URL", env_url_raw, sizeof(env_url_raw))
@@ -282,7 +293,7 @@ int main(int argc, char *argv[]) {
     if (have_env_url)
         finalize_url(env_url_raw, proj, env_url, sizeof(env_url));
 
-    /* Expand -u flag similarly (so `-u git@github.com:you` works) */
+    /* -u flag, finalized the same way */
     char flag_url[AG_PATH] = {0};
     if (url) finalize_url(url, proj, flag_url, sizeof(flag_url));
 
@@ -324,7 +335,7 @@ int main(int argc, char *argv[]) {
             snprintf(chosen, sizeof(chosen), "%s", flag_url);
         } else if (have_env_url) {
             snprintf(chosen, sizeof(chosen), "%s", env_url);
-            printf("Using GIT_REMOTE_URL from .env → %s\n", chosen);
+            printf("Using GIT_REMOTE_URL from .env -> %s\n", chosen);
         } else if (noninteractive) {
             snprintf(chosen, sizeof(chosen), "%s", default_url);
         } else {

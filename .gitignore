@@ -1,11 +1,30 @@
-# ── Build artifacts ───────────────────────────────────────────────────
+# ── Build output ──────────────────────────────────────────────────────
+# Everything the Makefile produces lands here — one entry covers it all.
+build/
+
+# Belt-and-braces for anyone compiling by hand with plain gcc:
 *.o
 *.obj
 *.exe
 *.out
+a.out
 autogit
 autogit.exe
-a.out
+
+# ── autogit temp files ────────────────────────────────────────────────
+# The tool writes its commit message to $TMPDIR / %TEMP% and deletes it,
+# but a crash mid-run can leave one behind in the repo if TMPDIR points
+# at the project.
+autogit_*.tmp
+
+# ── .env ──────────────────────────────────────────────────────────────
+# Holds only GIT_REMOTE_URL (a public git URL, not a secret), so it is
+# committed on purpose — cloning the repo means `autogit` just works.
+# Uncomment the next line if you ever put tokens or local overrides in
+# .env and don't want them pushed.
+# .env
+.env.local
+.env.*.local
 
 # ── Editor / IDE ──────────────────────────────────────────────────────
 .vscode/
@@ -18,19 +37,40 @@ a.out
 
 # ── OS cruft ──────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
 Thumbs.db
+ehthumbs.db
 desktop.ini
 
-# ── Scratch / temp ────────────────────────────────────────────────────
-*.tmp
+# ── Logs / scratch ────────────────────────────────────────────────────
 *.log
+*.tmp
+!autogit_*.tmp
 /tmp/
-.env
 
-# ── autogit per-project config ────────────────────────────────────────
-# .env holds only GIT_REMOTE_URL (a public git URL, not a secret), so
-# by default we let it travel with the repo — everyone who clones gets
-# the right remote out of the box. Uncomment the line below if you keep
-# local overrides (tokens, alternate remotes) in .env and don't want
-# them committed.
-# .env
+# ── Windows reserved-name leftovers ───────────────────────────────────
+# A file literally named NUL can appear if a POSIX shell ever interprets
+# `>NUL`. Git ignores it; this keeps it out of `git status` noise too.
+NUL
+CON
+PRN
+AUX
+COM1
+COM2
+COM3
+COM4
+COM5
+COM6
+COM7
+COM8
+COM9
+LPT1
+LPT2
+LPT3
+LPT4
+LPT5
+LPT6
+LPT7
+LPT8
+LPT9
