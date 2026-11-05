@@ -50,7 +50,12 @@ static int has_changes(void) {
     return ch != EOF;
 }
 
-/* ── Portable temp file (moved up — needed by github_create_repo) ── */
+/* ── Small string helper ──────────────────────────────────────────── */
+static void to_lower(char *s) {
+    for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s = (char)(*s + 32);
+}
+
+/* ── Portable temp file ───────────────────────────────────────────── */
 static int make_temp(char *out, size_t outsz) {
     const char *dir = getenv("TMPDIR");
 #if defined(_WIN32) && !defined(__MSYS__)
@@ -74,7 +79,7 @@ static int make_temp(char *out, size_t outsz) {
     return -1;
 }
 
-/* ── Prompt / input ───────────────────────────────────────────────── */
+/* ── Prompt ───────────────────────────────────────────────────────── */
 static int prompt(const char *label, char *buf, size_t bufsz) {
     printf("%s", label);
     fflush(stdout);
@@ -166,7 +171,7 @@ static void finalize_url(const char *base, const char *proj,
     snprintf(out, outsz, "%.*s/%s.git", (int)n, base, proj);
 }
 
-/* ── Git URL parsing → host / owner / repo ───────────────────────── */
+/* ── Git URL parsing ──────────────────────────────────────────────── */
 static int parse_git_url(const char *url, char *host, size_t hsz,
                          char *owner, size_t osz, char *repo, size_t rsz) {
     host[0] = owner[0] = repo[0] = 0;
@@ -211,13 +216,14 @@ static int parse_git_url(const char *url, char *host, size_t hsz,
     return 0;
 }
 
-/* ── GitHub repo existence + creation ─────────────────────────────── */
+/* ── GitHub helpers ───────────────────────────────────────────────── */
 static int gh_available(void) {
     if (system("gh --version" R_NULL) != 0) return 0;
     if (system("gh auth status" R_NULL) != 0) return 0;
     return 1;
 }
 
+/* 1 = exists, 0 = doesn't exist, -1 = unknown */
 static int github_repo_exists(const char *owner, const char *repo) {
     if (gh_available()) {
         char q[512];
@@ -244,11 +250,11 @@ static int github_is_org(const char *owner, const char *token) {
     return system(q) == 0 ? 1 : 0;
 }
 
+/* visibility: "public" or "private" — caller normalizes */
 static int github_create_repo(const char *owner, const char *repo,
                               const char *visibility, int noninteractive) {
-    int priv = !visibility || visibility[0] == 0 || strcmp(visibility, "public") != 0;
+    int priv = strcmp(visibility, "public") != 0;
 
-    /* Preferred: gh CLI (no token needed) */
     if (gh_available()) {
         char q[512];
         if (noninteractive) {
@@ -261,10 +267,8 @@ static int github_create_repo(const char *owner, const char *repo,
                 owner, repo, priv ? "private" : "public", R_NULL);
         }
         if (run(q) == 0) return 0;
-        /* fall through to API */
     }
 
-    /* Fallback: REST API with GITHUB_TOKEN */
     const char *tok = getenv("GITHUB_TOKEN");
     if (!tok || !tok[0]) {
         fprintf(stderr,
@@ -360,6 +364,8 @@ static void usage(const char *p) {
         "  -b <branch>    Branch to push (default: current)\n"
         "  -d <desc>      Short description (commit msg + .git/description)\n"
         "  -n             Non-interactive (use defaults, never prompt)\n"
+        "  --public       Create the GitHub repo as public  (creation only)\n"
+        "  --private      Create the GitHub repo as private (creation only, default)\n"
         "  -h             Show help\n"
         "\n"
         "URL precedence: -u flag  >  .env GIT_REMOTE_URL  >  prompt\n"
@@ -367,8 +373,13 @@ static void usage(const char *p) {
         "\n"
         "If the remote is a GitHub URL and the repo doesn't exist, autogit\n"
         "offers to create it via `gh` (if installed) or the REST API with\n"
-        "GITHUB_TOKEN from .env. Set GITHUB_VISIBILITY=public|private\n"
-        "(default: private) to choose repo visibility.\n", p);
+        "GITHUB_TOKEN from .env.\n"
+        "\n"
+        "Visibility when creating:\n"
+        "  --public / --private   explicit, overrides everything\n"
+        "  interactive prompt      asks before creating (unless -n)\n"
+        "  GITHUB_VISIBILITY=...   from .env as the default\n"
+        "  otherwise               private\n", p);
 }
 
 /* ── Main ─────────────────────────────────────────────────────────── */
@@ -378,15 +389,24 @@ int main(int argc, char *argv[]) {
     const char *url    = NULL;
     const char *desc   = NULL;
     int noninteractive = 0;
+    int force_public   = 0;
+    int force_private  = 0;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-u") && i+1 < argc) url    = argv[++i];
         else if (!strcmp(argv[i], "-r") && i+1 < argc) remote = argv[++i];
         else if (!strcmp(argv[i], "-b") && i+1 < argc) branch = argv[++i];
         else if (!strcmp(argv[i], "-d") && i+1 < argc) desc   = argv[++i];
-        else if (!strcmp(argv[i], "-n")) noninteractive = 1;
+        else if (!strcmp(argv[i], "-n"))            noninteractive = 1;
+        else if (!strcmp(argv[i], "--public"))      force_public   = 1;
+        else if (!strcmp(argv[i], "--private"))     force_private  = 1;
         else if (!strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
+    }
+
+    if (force_public && force_private) {
+        fprintf(stderr, "Cannot use --public and --private together.\n");
+        return 1;
     }
 
     if (system("git rev-parse --is-inside-work-tree" R_NULL) != 0) {
@@ -421,8 +441,21 @@ int main(int argc, char *argv[]) {
     if (have_env_url)
         finalize_url(env_url_raw, proj, env_url, sizeof(env_url));
 
+    /* Visibility base: env > default("private"); flags override later */
     char visibility[32] = "private";
-    load_env(root, "GITHUB_VISIBILITY", visibility, sizeof(visibility));
+    char vis_env[32] = {0};
+    if (load_env(root, "GITHUB_VISIBILITY", vis_env, sizeof(vis_env)) && vis_env[0]) {
+        snprintf(visibility, sizeof(visibility), "%s", vis_env);
+    }
+    to_lower(visibility);
+    if (strcmp(visibility, "public") != 0 && strcmp(visibility, "private") != 0) {
+        fprintf(stderr,
+            "warning: GITHUB_VISIBILITY='%s' not 'public' or 'private' — using 'private'\n",
+            visibility);
+        strcpy(visibility, "private");
+    }
+    if (force_public)  strcpy(visibility, "public");
+    if (force_private) strcpy(visibility, "private");
 
     char gh_token[AG_LINE] = {0};
     if (load_env(root, "GITHUB_TOKEN", gh_token, sizeof(gh_token)) && gh_token[0]) {
@@ -533,11 +566,41 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "Aborted (repo missing).\n");
                     return 1;
                 }
+
+                /* ── Visibility prompt (skipped with flags or -n) ── */
+                if (!noninteractive && !force_public && !force_private) {
+                    char vis_choice[32];
+                    char vlabel[96];
+                    snprintf(vlabel, sizeof(vlabel),
+                             "Visibility [private/public] (%s): ", visibility);
+                    if (!prompt(vlabel, vis_choice, sizeof(vis_choice))) return 1;
+                    if (vis_choice[0]) {
+                        to_lower(vis_choice);
+                        if (!strcmp(vis_choice, "public") || !strcmp(vis_choice, "p")) {
+                            strcpy(visibility, "public");
+                        } else if (!strcmp(vis_choice, "private") ||
+                                   !strcmp(vis_choice, "priv")) {
+                            strcpy(visibility, "private");
+                        } else {
+                            fprintf(stderr, "Invalid choice '%s' — keeping %s\n",
+                                    vis_choice, visibility);
+                        }
+                    }
+                }
+
+                printf("Creating %s/%s as %s ...\n", owner, repo_name, visibility);
                 if (github_create_repo(owner, repo_name, visibility, noninteractive) != 0) {
                     fprintf(stderr, "Failed to create %s/%s on GitHub.\n", owner, repo_name);
                     return 1;
                 }
-                printf("Created https://github.com/%s/%s\n", owner, repo_name);
+                printf("Created https://github.com/%s/%s (%s)\n",
+                       owner, repo_name, visibility);
+            } else if (exists == 1) {
+                if (force_public || force_private)
+                    fprintf(stderr,
+                        "note: --public/--private only apply when creating a new repo; "
+                        "%s/%s already exists — change visibility in GitHub settings\n",
+                        owner, repo_name);
             } else if (exists == -1) {
                 fprintf(stderr,
                     "note: cannot verify %s/%s exists (no gh CLI, no GITHUB_TOKEN).\n"
