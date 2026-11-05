@@ -1,8 +1,4 @@
-/* ── Platform layer ───────────────────────────────────────────────── *
- * __MSYS__ is defined by MSYS gcc, whose system()/popen() shell out  *
- * to sh.exe — so we must use POSIX redirects even on Windows.        *
- * MinGW-w64 gcc (the desired toolchain) uses cmd.exe, so it wants    *
- * the NUL device.                                                     */
+/* ── Platform layer ───────────────────────────────────────────────── */
 #if defined(__MSYS__)
 #  include <unistd.h>
 #  include <sys/stat.h>
@@ -54,6 +50,30 @@ static int has_changes(void) {
     return ch != EOF;
 }
 
+/* ── Portable temp file (moved up — needed by github_create_repo) ── */
+static int make_temp(char *out, size_t outsz) {
+    const char *dir = getenv("TMPDIR");
+#if defined(_WIN32) && !defined(__MSYS__)
+    if (!dir) dir = getenv("TEMP");
+    if (!dir) dir = getenv("TMP");
+#endif
+    if (!dir || !dir[0]) {
+#if defined(_WIN32) && !defined(__MSYS__)
+        dir = ".";
+#else
+        dir = "/tmp";
+#endif
+    }
+    for (int i = 0; i < 1000; i++) {
+        snprintf(out, outsz, "%s%sautogit_%d_%d.tmp",
+                 dir, PATHSEP, (int)AG_GETPID(), i);
+        FILE *f = fopen(out, "r");
+        if (f) { fclose(f); continue; }
+        return 0;
+    }
+    return -1;
+}
+
 /* ── Prompt / input ───────────────────────────────────────────────── */
 static int prompt(const char *label, char *buf, size_t bufsz) {
     printf("%s", label);
@@ -65,7 +85,7 @@ static int prompt(const char *label, char *buf, size_t bufsz) {
     return 1;
 }
 
-/* ── ~/.autogitrc (HOME on POSIX, USERPROFILE on Windows) ────────── */
+/* ── ~/.autogitrc ─────────────────────────────────────────────────── */
 static const char *config_path(void) {
     static char path[AG_PATH];
     const char *home = getenv("HOME");
@@ -100,9 +120,7 @@ static void save_config(const char *user, const char *host) {
 #endif
 }
 
-/* ── .env loader ──────────────────────────────────────────────────── *
- * Minimal KEY=VALUE parser: # comments, blank lines, optional "…" /  *
- * '…' quoting around the value. First match wins.                    */
+/* ── .env loader ──────────────────────────────────────────────────── */
 static int load_env(const char *root, const char *key, char *out, size_t outsz) {
     char path[AG_PATH];
     snprintf(path, sizeof(path), "%s%s.env", root, PATHSEP);
@@ -136,9 +154,7 @@ static int load_env(const char *root, const char *key, char *out, size_t outsz) 
     return found;
 }
 
-/* ── URL finalization ─────────────────────────────────────────────── *
- * If base ends in ".git", copy as-is.                                *
- * Otherwise strip trailing slashes and append "/<proj>.git".         */
+/* ── URL finalization ─────────────────────────────────────────────── */
 static void finalize_url(const char *base, const char *proj,
                          char *out, size_t outsz) {
     size_t n = strlen(base);
@@ -148,6 +164,143 @@ static void finalize_url(const char *base, const char *proj,
     }
     while (n > 0 && (base[n-1] == '/' || base[n-1] == '\\')) n--;
     snprintf(out, outsz, "%.*s/%s.git", (int)n, base, proj);
+}
+
+/* ── Git URL parsing → host / owner / repo ───────────────────────── */
+static int parse_git_url(const char *url, char *host, size_t hsz,
+                         char *owner, size_t osz, char *repo, size_t rsz) {
+    host[0] = owner[0] = repo[0] = 0;
+    const char *p = url;
+
+    if      (strncmp(p, "https://", 8) == 0) p += 8;
+    else if (strncmp(p, "http://",  7) == 0) p += 7;
+    else if (strncmp(p, "ssh://",   6) == 0) p += 6;
+
+    const char *at    = strchr(p, '@');
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    if (at && (!slash || at < slash) && (!colon || at < colon))
+        p = at + 1;
+
+    const char *sep = NULL;
+    for (const char *q = p; *q; q++)
+        if (*q == ':' || *q == '/') { sep = q; break; }
+    if (!sep) return -1;
+
+    size_t hlen = (size_t)(sep - p);
+    if (hlen == 0 || hlen >= hsz) return -1;
+    memcpy(host, p, hlen); host[hlen] = 0;
+
+    p = sep + 1;
+    while (*p == '/') p++;
+
+    const char *owner_end = strchr(p, '/');
+    if (!owner_end) return -1;
+    size_t olen = (size_t)(owner_end - p);
+    if (olen == 0 || olen >= osz) return -1;
+    memcpy(owner, p, olen); owner[olen] = 0;
+
+    p = owner_end + 1;
+    const char *repo_end = p + strlen(p);
+    if (repo_end - p > 4 && strcmp(repo_end - 4, ".git") == 0)
+        repo_end -= 4;
+    size_t rlen = (size_t)(repo_end - p);
+    if (rlen == 0 || rlen >= rsz) return -1;
+    memcpy(repo, p, rlen); repo[rlen] = 0;
+
+    return 0;
+}
+
+/* ── GitHub repo existence + creation ─────────────────────────────── */
+static int gh_available(void) {
+    if (system("gh --version" R_NULL) != 0) return 0;
+    if (system("gh auth status" R_NULL) != 0) return 0;
+    return 1;
+}
+
+static int github_repo_exists(const char *owner, const char *repo) {
+    if (gh_available()) {
+        char q[512];
+        snprintf(q, sizeof(q), "gh repo view %s/%s%s", owner, repo, R_NULL);
+        return system(q) == 0 ? 1 : 0;
+    }
+    const char *tok = getenv("GITHUB_TOKEN");
+    if (!tok || !tok[0]) return -1;
+
+    char q[512];
+    snprintf(q, sizeof(q),
+        "curl -sf -H \"Authorization: token %s\" "
+        "https://api.github.com/repos/%s/%s%s",
+        tok, owner, repo, R_NULL);
+    return system(q) == 0 ? 1 : 0;
+}
+
+static int github_is_org(const char *owner, const char *token) {
+    char q[512];
+    snprintf(q, sizeof(q),
+        "curl -sf -H \"Authorization: token %s\" "
+        "https://api.github.com/orgs/%s%s",
+        token, owner, R_NULL);
+    return system(q) == 0 ? 1 : 0;
+}
+
+static int github_create_repo(const char *owner, const char *repo,
+                              const char *visibility, int noninteractive) {
+    int priv = !visibility || visibility[0] == 0 || strcmp(visibility, "public") != 0;
+
+    /* Preferred: gh CLI (no token needed) */
+    if (gh_available()) {
+        char q[512];
+        if (noninteractive) {
+            snprintf(q, sizeof(q),
+                "echo y | gh repo create %s/%s --%s%s",
+                owner, repo, priv ? "private" : "public", R_NULL);
+        } else {
+            snprintf(q, sizeof(q),
+                "gh repo create %s/%s --%s%s",
+                owner, repo, priv ? "private" : "public", R_NULL);
+        }
+        if (run(q) == 0) return 0;
+        /* fall through to API */
+    }
+
+    /* Fallback: REST API with GITHUB_TOKEN */
+    const char *tok = getenv("GITHUB_TOKEN");
+    if (!tok || !tok[0]) {
+        fprintf(stderr,
+            "Cannot create repository: install `gh` (https://cli.github.com)\n"
+            "and run `gh auth login`, or set GITHUB_TOKEN in .env (needs `repo` scope).\n");
+        return 1;
+    }
+
+    char body[AG_PATH];
+    if (make_temp(body, sizeof(body)) != 0) {
+        fprintf(stderr, "cannot create temp file\n");
+        return 1;
+    }
+    FILE *bf = fopen(body, "w");
+    if (!bf) { perror(body); return 1; }
+    fprintf(bf, "{\"name\":\"%s\",\"private\":%s}",
+            repo, priv ? "true" : "false");
+    fclose(bf);
+
+    char endpoint[512];
+    if (github_is_org(owner, tok) == 1)
+        snprintf(endpoint, sizeof(endpoint), "orgs/%s/repos", owner);
+    else
+        snprintf(endpoint, sizeof(endpoint), "user/repos");
+
+    char q[AG_CMD];
+    snprintf(q, sizeof(q),
+        "curl -sf -X POST -H \"Authorization: token %s\" "
+        "-H \"Accept: application/vnd.github+json\" "
+        "-H \"Content-Type: application/json\" "
+        "--data-binary @\"%s\" "
+        "https://api.github.com/%s%s",
+        tok, body, endpoint, R_NULL);
+    int rc = system(q);
+    remove(body);
+    return rc == 0 ? 0 : 1;
 }
 
 /* ── Repo discovery ───────────────────────────────────────────────── */
@@ -170,31 +323,7 @@ static void project_name(const char *root, char *out, size_t outsz) {
     if (n > 4 && !strcmp(out + n - 4, ".git")) out[n - 4] = 0;
 }
 
-/* ── Portable temp file ───────────────────────────────────────────── */
-static int make_temp(char *out, size_t outsz) {
-    const char *dir = getenv("TMPDIR");
-#if defined(_WIN32) && !defined(__MSYS__)
-    if (!dir) dir = getenv("TEMP");
-    if (!dir) dir = getenv("TMP");
-#endif
-    if (!dir || !dir[0]) {
-#if defined(_WIN32) && !defined(__MSYS__)
-        dir = ".";
-#else
-        dir = "/tmp";
-#endif
-    }
-    for (int i = 0; i < 1000; i++) {
-        snprintf(out, outsz, "%s%sautogit_%d_%d.tmp",
-                 dir, PATHSEP, (int)AG_GETPID(), i);
-        FILE *f = fopen(out, "r");
-        if (f) { fclose(f); continue; }
-        return 0;
-    }
-    return -1;
-}
-
-/* Commit via temp file — survives ", $, `, ' in the message */
+/* ── Commit / description ─────────────────────────────────────────── */
 static int commit_with_message(const char *msg) {
     char tmp[AG_PATH];
     if (make_temp(tmp, sizeof(tmp)) != 0) {
@@ -234,10 +363,12 @@ static void usage(const char *p) {
         "  -h             Show help\n"
         "\n"
         "URL precedence: -u flag  >  .env GIT_REMOTE_URL  >  prompt\n"
-        "A base URL without a .git suffix gets /<project>.git appended\n"
-        "  e.g.  -u git@github.com:you   ->   git@github.com:you/<project>.git\n"
-        "First interactive run creates ~/.autogitrc (HOME or USERPROFILE)\n"
-        "with your host + username for the auto-built default URL.\n", p);
+        "A base URL without .git gets /<project>.git appended.\n"
+        "\n"
+        "If the remote is a GitHub URL and the repo doesn't exist, autogit\n"
+        "offers to create it via `gh` (if installed) or the REST API with\n"
+        "GITHUB_TOKEN from .env. Set GITHUB_VISIBILITY=public|private\n"
+        "(default: private) to choose repo visibility.\n", p);
 }
 
 /* ── Main ─────────────────────────────────────────────────────────── */
@@ -270,7 +401,6 @@ int main(int argc, char *argv[]) {
     char proj[256];
     project_name(root, proj, sizeof(proj));
 
-    /* Current branch */
     char cur_branch[256] = {0};
     if (!branch) {
         FILE *fp = popen("git symbolic-ref --short HEAD" R_ERR, "r");
@@ -283,9 +413,7 @@ int main(int argc, char *argv[]) {
         branch = cur_branch;
     }
 
-    int added_remote = 0;
-
-    /* .env URL (if any), finalized with project name */
+    /* .env: GIT_REMOTE_URL, GITHUB_VISIBILITY, GITHUB_TOKEN */
     char env_url_raw[AG_PATH] = {0};
     char env_url[AG_PATH]     = {0};
     int have_env_url = load_env(root, "GIT_REMOTE_URL", env_url_raw, sizeof(env_url_raw))
@@ -293,9 +421,22 @@ int main(int argc, char *argv[]) {
     if (have_env_url)
         finalize_url(env_url_raw, proj, env_url, sizeof(env_url));
 
-    /* -u flag, finalized the same way */
+    char visibility[32] = "private";
+    load_env(root, "GITHUB_VISIBILITY", visibility, sizeof(visibility));
+
+    char gh_token[AG_LINE] = {0};
+    if (load_env(root, "GITHUB_TOKEN", gh_token, sizeof(gh_token)) && gh_token[0]) {
+#ifdef _WIN32
+        _putenv_s("GITHUB_TOKEN", gh_token);
+#else
+        setenv("GITHUB_TOKEN", gh_token, 1);
+#endif
+    }
+
     char flag_url[AG_PATH] = {0};
     if (url) finalize_url(url, proj, flag_url, sizeof(flag_url));
+
+    int added_remote = 0;
 
     /* ── Remote setup ─────────────────────────────────────────────── */
     if (!remote_exists(remote)) {
@@ -356,22 +497,62 @@ int main(int argc, char *argv[]) {
         char cmd[AG_CMD];
         snprintf(cmd, sizeof(cmd), "git remote set-url %s \"%s\"", remote, flag_url);
         run(cmd);
-    } else if (have_env_url) {
-        /* Remote already configured — warn if .env disagrees, don't rewrite */
-        char cur[AG_PATH] = {0};
+    }
+
+    /* Read back configured remote URL */
+    char cur_url[AG_PATH] = {0};
+    {
         char q[512];
         snprintf(q, sizeof(q), "git remote get-url %s", remote);
         FILE *fp = popen(q, "r");
         if (fp) {
-            if (fgets(cur, sizeof(cur), fp)) cur[strcspn(cur, "\r\n")] = 0;
+            if (fgets(cur_url, sizeof(cur_url), fp))
+                cur_url[strcspn(cur_url, "\r\n")] = 0;
             pclose(fp);
         }
-        if (cur[0] && strcmp(cur, env_url) != 0) {
-            fprintf(stderr, "note: .env GIT_REMOTE_URL differs from current remote\n");
-            fprintf(stderr, "      current: %s\n", cur);
-            fprintf(stderr, "      .env:    %s\n", env_url);
-            fprintf(stderr, "      pass -u \"%s\" to change it\n", env_url);
+    }
+
+    /* ── Ensure GitHub repo exists, offer to create if missing ───── */
+    {
+        char host[128], owner[128], repo_name[128];
+        if (cur_url[0]
+            && parse_git_url(cur_url, host, sizeof(host),
+                             owner, sizeof(owner), repo_name, sizeof(repo_name)) == 0
+            && strcmp(host, "github.com") == 0) {
+
+            int exists = github_repo_exists(owner, repo_name);
+            if (exists == 0) {
+                printf("\nRepository %s/%s does not exist on GitHub.\n", owner, repo_name);
+                int go = 1;
+                if (!noninteractive) {
+                    char ans[16];
+                    if (!prompt("Create it now? [Y/n]: ", ans, sizeof(ans))) return 1;
+                    if (ans[0] == 'n' || ans[0] == 'N') go = 0;
+                }
+                if (!go) {
+                    fprintf(stderr, "Aborted (repo missing).\n");
+                    return 1;
+                }
+                if (github_create_repo(owner, repo_name, visibility, noninteractive) != 0) {
+                    fprintf(stderr, "Failed to create %s/%s on GitHub.\n", owner, repo_name);
+                    return 1;
+                }
+                printf("Created https://github.com/%s/%s\n", owner, repo_name);
+            } else if (exists == -1) {
+                fprintf(stderr,
+                    "note: cannot verify %s/%s exists (no gh CLI, no GITHUB_TOKEN).\n"
+                    "      continuing — push may fail if repo is missing.\n",
+                    owner, repo_name);
+            }
         }
+    }
+
+    /* .env-vs-current warning */
+    if (have_env_url && cur_url[0] && strcmp(cur_url, env_url) != 0) {
+        fprintf(stderr, "note: .env GIT_REMOTE_URL differs from current remote\n");
+        fprintf(stderr, "      current: %s\n", cur_url);
+        fprintf(stderr, "      .env:    %s\n", env_url);
+        fprintf(stderr, "      pass -u \"%s\" to change it\n", env_url);
     }
 
     /* ── Description / commit message ────────────────────────────── */
