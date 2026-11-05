@@ -1,0 +1,36 @@
+# ── Build artifacts ───────────────────────────────────────────────────
+*.o
+*.obj
+*.exe
+*.out
+autogit
+autogit.exe
+a.out
+
+# ── Editor / IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.\#*
+\#*\#
+
+# ── OS cruft ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Scratch / temp ────────────────────────────────────────────────────
+*.tmp
+*.log
+/tmp/
+.env
+
+# ── autogit per-project config ────────────────────────────────────────
+# .env holds only GIT_REMOTE_URL (a public git URL, not a secret), so
+# by default we let it travel with the repo — everyone who clones gets
+# the right remote out of the box. Uncomment the line below if you keep
+# local overrides (tokens, alternate remotes) in .env and don't want
+# them committed.
+# .env
