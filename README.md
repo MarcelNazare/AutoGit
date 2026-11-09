@@ -210,6 +210,19 @@ autogit -n -d "first push"
 
 Non-GitHub hosts (GitLab, Bitbucket, self-hosted) are skipped silently — `autogit` still pushes normally.
 
+### Description = About section
+
+The short description doubles as the GitHub repo's **About** text:
+
+- **On creation** — the description you enter becomes the About
+- **On subsequent runs with `-d "text"`** — About is updated to match
+- **On interactive runs without `-d`** — About is left alone (so routine
+  "fix typo" commits don't clobber your project blurb)
+
+Uses `gh api -X PATCH` when `gh` is authenticated, or `curl` + `GITHUB_TOKEN`
+otherwise. Quotes, newlines, and special characters in the description are
+safely JSON-escaped — no shell-escaping bugs.
+
 ## SSH setup (one-time)
 
 `autogit` uses whatever URL you give it. For `git@github.com:...` URLs you need a working SSH key:
