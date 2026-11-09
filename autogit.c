@@ -54,10 +54,7 @@ static void to_lower(char *s) {
     for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s = (char)(*s + 32);
 }
 
-/* ── Sanitize a directory name into a valid GitHub repo name ────── *
- *  " AURUM ZONES"  ->  "AURUM-ZONES"                                *
- *  Keeps [A-Za-z0-9._-], turns spaces into '-', strips leading/     *
- *  trailing '-' and '.', falls back to "repo" if empty.             */
+/* ── Sanitize a directory name into a valid GitHub repo name ────── */
 static void sanitize_repo_name(const char *in, char *out, size_t outsz) {
     if (outsz == 0) return;
     while (*in == ' ' || *in == '\t') in++;
@@ -343,6 +340,61 @@ static int github_create_repo(const char *owner, const char *repo,
     return rc == 0 ? 0 : 1;
 }
 
+/* ── Set repo description (About section) via PATCH ──────────────── *
+ * JSON-escapes the description so quotes/backslashes/newlines survive.*
+ * Prefers `gh api` (uses stored gh auth) → falls back to curl+token.  */
+static int github_set_description(const char *owner, const char *repo,
+                                  const char *desc) {
+    if (!desc || !desc[0]) return 0;
+
+    char body[AG_PATH];
+    if (make_temp(body, sizeof(body)) != 0) {
+        fprintf(stderr, "cannot create temp file\n");
+        return 1;
+    }
+    FILE *bf = fopen(body, "w");
+    if (!bf) { perror(body); return 1; }
+    fprintf(bf, "{\"description\":\"");
+    for (const char *p = desc; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\')      fprintf(bf, "\\%c", c);
+        else if (c == '\n')             fprintf(bf, "\\n");
+        else if (c == '\r')             fprintf(bf, "\\r");
+        else if (c == '\t')             fprintf(bf, "\\t");
+        else if (c < 0x20)              fprintf(bf, "\\u%04x", c);
+        else                            fputc(c, bf);
+    }
+    fprintf(bf, "\"}");
+    fclose(bf);
+
+    if (gh_available()) {
+        char q[AG_CMD];
+        snprintf(q, sizeof(q),
+            "gh api -X PATCH repos/%s/%s --input \"%s\"%s",
+            owner, repo, body, R_NULL);
+        int rc = system(q);
+        if (rc == 0) { remove(body); return 0; }
+    }
+
+    const char *tok = getenv("GITHUB_TOKEN");
+    if (tok && tok[0]) {
+        char q[AG_CMD];
+        snprintf(q, sizeof(q),
+            "curl -sf -X PATCH -H \"Authorization: token %s\" "
+            "-H \"Accept: application/vnd.github+json\" "
+            "-H \"Content-Type: application/json\" "
+            "--data-binary @\"%s\" "
+            "https://api.github.com/repos/%s/%s%s",
+            tok, body, owner, repo, R_NULL);
+        int rc = system(q);
+        remove(body);
+        return rc == 0 ? 0 : 1;
+    }
+
+    remove(body);
+    return 1;
+}
+
 /* ── Repo discovery ───────────────────────────────────────────────── */
 static void get_root(char *out, size_t outsz) {
     out[0] = 0;
@@ -398,7 +450,8 @@ static void usage(const char *p) {
         "  -u <url>       Remote URL (skips prompt; also updates existing remote)\n"
         "  -r <name>      Remote name (default: origin)\n"
         "  -b <branch>    Branch to push (default: current)\n"
-        "  -d <desc>      Short description (commit msg + .git/description)\n"
+        "  -d <desc>      Short description (commit msg + .git/description\n"
+        "                 + GitHub repo About section)\n"
         "  -n             Non-interactive (use defaults, never prompt)\n"
         "  --public       Create the GitHub repo as public\n"
         "  --private      Create the GitHub repo as private (default)\n"
@@ -406,7 +459,11 @@ static void usage(const char *p) {
         "\n"
         "URL precedence: -u flag  >  .env GIT_REMOTE_URL  >  prompt\n"
         "A base URL without .git gets /<sanitized-project>.git appended.\n"
-        "Spaces in the directory name become hyphens (GitHub rule).\n", p);
+        "Spaces in the directory name become hyphens (GitHub rule).\n"
+        "\n"
+        "The description is used as the commit message AND synced to the\n"
+        "GitHub repo's About section — always on first creation, and on\n"
+        "every run where -d is explicitly passed.\n", p);
 }
 
 /* ── Main ─────────────────────────────────────────────────────────── */
@@ -445,7 +502,6 @@ int main(int argc, char *argv[]) {
     get_root(root, sizeof(root));
     if (!root[0]) { fprintf(stderr, "Could not locate repo root.\n"); return 1; }
 
-    /* Project name → sanitize for GitHub */
     char proj[256];
     project_name(root, proj, sizeof(proj));
 
@@ -600,7 +656,19 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* ── Ensure GitHub repo exists, offer to create if missing ───── */
+    /* ── Description prompt (moved BEFORE repo-exists check) ─────── */
+    char message[AG_LINE];
+    if (desc) {
+        snprintf(message, sizeof(message), "%s", desc);
+    } else if (noninteractive) {
+        snprintf(message, sizeof(message), "auto-commit");
+    } else {
+        if (!prompt("Short description: ", message, sizeof(message))) return 1;
+        if (!message[0]) snprintf(message, sizeof(message), "auto-commit");
+    }
+    int is_real_desc = message[0] && strcmp(message, "auto-commit") != 0;
+
+    /* ── Ensure GitHub repo exists, create, and set About ────────── */
     {
         char host_p[128], owner[128], repo_name[128];
         if (cur_url[0]
@@ -622,6 +690,8 @@ int main(int argc, char *argv[]) {
             }
 
             int exists = github_repo_exists(owner, repo_name);
+            int repo_created = 0;
+
             if (exists == 0) {
                 printf("\nRepository %s/%s does not exist on GitHub.\n", owner, repo_name);
                 int go = 1;
@@ -661,31 +731,40 @@ int main(int argc, char *argv[]) {
                 }
                 printf("Created https://github.com/%s/%s (%s)\n",
                        owner, repo_name, visibility);
+                repo_created = 1;
+
+                /* Set About on new repo */
+                if (is_real_desc) {
+                    printf("Setting repo description: \"%s\"\n", message);
+                    if (github_set_description(owner, repo_name, message) != 0)
+                        fprintf(stderr,
+                            "note: could not set repo description (About)\n");
+                }
             } else if (exists == 1) {
                 if (force_public || force_private)
                     fprintf(stderr,
                         "note: --public/--private only apply when creating; "
                         "%s/%s already exists\n", owner, repo_name);
+
+                /* Update About only when -d was explicitly passed */
+                if (desc && is_real_desc) {
+                    printf("Updating repo description: \"%s\"\n", message);
+                    if (github_set_description(owner, repo_name, message) != 0)
+                        fprintf(stderr,
+                            "note: could not update repo description (About)\n");
+                }
             } else if (exists == -1) {
                 fprintf(stderr,
                     "note: cannot verify %s/%s exists (no gh CLI, no GITHUB_TOKEN).\n"
                     "      continuing — push may fail if repo is missing.\n",
                     owner, repo_name);
             }
+
+            (void)repo_created;
         }
     }
 
-    /* ── Description / commit message ────────────────────────────── */
-    char message[AG_LINE];
-    if (desc) {
-        snprintf(message, sizeof(message), "%s", desc);
-    } else if (noninteractive) {
-        snprintf(message, sizeof(message), "auto-commit");
-    } else {
-        if (!prompt("Short description: ", message, sizeof(message))) return 1;
-        if (!message[0]) snprintf(message, sizeof(message), "auto-commit");
-    }
-
+    /* ── Commit ──────────────────────────────────────────────────── */
     if (has_changes()) {
         if (run("git add -A") != 0) return 1;
         if (commit_with_message(message) != 0) {
