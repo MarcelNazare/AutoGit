@@ -50,9 +50,40 @@ static int has_changes(void) {
     return ch != EOF;
 }
 
-/* ── Small string helper ──────────────────────────────────────────── */
 static void to_lower(char *s) {
     for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s = (char)(*s + 32);
+}
+
+/* ── Sanitize a directory name into a valid GitHub repo name ────── *
+ *  " AURUM ZONES"  ->  "AURUM-ZONES"                                *
+ *  Keeps [A-Za-z0-9._-], turns spaces into '-', strips leading/     *
+ *  trailing '-' and '.', falls back to "repo" if empty.             */
+static void sanitize_repo_name(const char *in, char *out, size_t outsz) {
+    if (outsz == 0) return;
+    while (*in == ' ' || *in == '\t') in++;
+    const char *end = in + strlen(in);
+    while (end > in && (end[-1] == ' ' || end[-1] == '\t')) end--;
+
+    size_t j = 0;
+    for (; in < end && j < outsz - 1; in++) {
+        char c = *in;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+            out[j++] = c;
+        } else if (c == ' ' || c == '\t') {
+            out[j++] = '-';
+        }
+    }
+    out[j] = 0;
+
+    char *start = out;
+    while (*start == '-' || *start == '.') start++;
+    if (start != out) memmove(out, start, strlen(start) + 1);
+
+    size_t len = strlen(out);
+    while (len > 0 && (out[len-1] == '-' || out[len-1] == '.')) out[--len] = 0;
+
+    if (out[0] == 0) snprintf(out, outsz, "repo");
 }
 
 /* ── Portable temp file ───────────────────────────────────────────── */
@@ -223,11 +254,11 @@ static int gh_available(void) {
     return 1;
 }
 
-/* 1 = exists, 0 = doesn't exist, -1 = unknown */
 static int github_repo_exists(const char *owner, const char *repo) {
     if (gh_available()) {
         char q[512];
-        snprintf(q, sizeof(q), "gh repo view %s/%s%s", owner, repo, R_NULL);
+        snprintf(q, sizeof(q),
+                 "gh repo view \"%s/%s\"%s", owner, repo, R_NULL);
         return system(q) == 0 ? 1 : 0;
     }
     const char *tok = getenv("GITHUB_TOKEN");
@@ -250,30 +281,35 @@ static int github_is_org(const char *owner, const char *token) {
     return system(q) == 0 ? 1 : 0;
 }
 
-/* visibility: "public" or "private" — caller normalizes */
 static int github_create_repo(const char *owner, const char *repo,
                               const char *visibility, int noninteractive) {
     int priv = strcmp(visibility, "public") != 0;
+    int tried_gh = 0;
 
     if (gh_available()) {
+        tried_gh = 1;
         char q[512];
         if (noninteractive) {
             snprintf(q, sizeof(q),
-                "echo y | gh repo create %s/%s --%s%s",
+                "echo y | gh repo create \"%s/%s\" --%s%s",
                 owner, repo, priv ? "private" : "public", R_NULL);
         } else {
             snprintf(q, sizeof(q),
-                "gh repo create %s/%s --%s%s",
+                "gh repo create \"%s/%s\" --%s%s",
                 owner, repo, priv ? "private" : "public", R_NULL);
         }
         if (run(q) == 0) return 0;
+        fprintf(stderr, "gh repo create failed for %s/%s\n", owner, repo);
     }
 
     const char *tok = getenv("GITHUB_TOKEN");
     if (!tok || !tok[0]) {
-        fprintf(stderr,
-            "Cannot create repository: install `gh` (https://cli.github.com)\n"
-            "and run `gh auth login`, or set GITHUB_TOKEN in .env (needs `repo` scope).\n");
+        if (tried_gh)
+            fprintf(stderr, "No GITHUB_TOKEN fallback — cannot retry via API.\n");
+        else
+            fprintf(stderr,
+                "Cannot create repository: install `gh` (https://cli.github.com)\n"
+                "and run `gh auth login`, or set GITHUB_TOKEN in .env (needs `repo` scope).\n");
         return 1;
     }
 
@@ -364,22 +400,13 @@ static void usage(const char *p) {
         "  -b <branch>    Branch to push (default: current)\n"
         "  -d <desc>      Short description (commit msg + .git/description)\n"
         "  -n             Non-interactive (use defaults, never prompt)\n"
-        "  --public       Create the GitHub repo as public  (creation only)\n"
-        "  --private      Create the GitHub repo as private (creation only, default)\n"
+        "  --public       Create the GitHub repo as public\n"
+        "  --private      Create the GitHub repo as private (default)\n"
         "  -h             Show help\n"
         "\n"
         "URL precedence: -u flag  >  .env GIT_REMOTE_URL  >  prompt\n"
-        "A base URL without .git gets /<project>.git appended.\n"
-        "\n"
-        "If the remote is a GitHub URL and the repo doesn't exist, autogit\n"
-        "offers to create it via `gh` (if installed) or the REST API with\n"
-        "GITHUB_TOKEN from .env.\n"
-        "\n"
-        "Visibility when creating:\n"
-        "  --public / --private   explicit, overrides everything\n"
-        "  interactive prompt      asks before creating (unless -n)\n"
-        "  GITHUB_VISIBILITY=...   from .env as the default\n"
-        "  otherwise               private\n", p);
+        "A base URL without .git gets /<sanitized-project>.git appended.\n"
+        "Spaces in the directory name become hyphens (GitHub rule).\n", p);
 }
 
 /* ── Main ─────────────────────────────────────────────────────────── */
@@ -418,8 +445,21 @@ int main(int argc, char *argv[]) {
     get_root(root, sizeof(root));
     if (!root[0]) { fprintf(stderr, "Could not locate repo root.\n"); return 1; }
 
+    /* Project name → sanitize for GitHub */
     char proj[256];
     project_name(root, proj, sizeof(proj));
+
+    char proj_raw[256];
+    snprintf(proj_raw, sizeof(proj_raw), "%s", proj);
+    char proj_clean[256];
+    sanitize_repo_name(proj_raw, proj_clean, sizeof(proj_clean));
+    snprintf(proj, sizeof(proj), "%s", proj_clean);
+
+    if (strcmp(proj_raw, proj) != 0) {
+        fprintf(stderr,
+            "note: directory '%s' -> repo name '%s' (GitHub-valid)\n",
+            proj_raw, proj);
+    }
 
     char cur_branch[256] = {0};
     if (!branch) {
@@ -441,19 +481,13 @@ int main(int argc, char *argv[]) {
     if (have_env_url)
         finalize_url(env_url_raw, proj, env_url, sizeof(env_url));
 
-    /* Visibility base: env > default("private"); flags override later */
     char visibility[32] = "private";
     char vis_env[32] = {0};
-    if (load_env(root, "GITHUB_VISIBILITY", vis_env, sizeof(vis_env)) && vis_env[0]) {
+    if (load_env(root, "GITHUB_VISIBILITY", vis_env, sizeof(vis_env)) && vis_env[0])
         snprintf(visibility, sizeof(visibility), "%s", vis_env);
-    }
     to_lower(visibility);
-    if (strcmp(visibility, "public") != 0 && strcmp(visibility, "private") != 0) {
-        fprintf(stderr,
-            "warning: GITHUB_VISIBILITY='%s' not 'public' or 'private' — using 'private'\n",
-            visibility);
+    if (strcmp(visibility, "public") != 0 && strcmp(visibility, "private") != 0)
         strcpy(visibility, "private");
-    }
     if (force_public)  strcpy(visibility, "public");
     if (force_private) strcpy(visibility, "private");
 
@@ -526,10 +560,31 @@ int main(int argc, char *argv[]) {
         snprintf(cmd, sizeof(cmd), "git remote add %s \"%s\"", remote, chosen);
         if (run(cmd) != 0) { fprintf(stderr, "git remote add failed.\n"); return 1; }
         added_remote = 1;
-    } else if (flag_url[0]) {
-        char cmd[AG_CMD];
-        snprintf(cmd, sizeof(cmd), "git remote set-url %s \"%s\"", remote, flag_url);
-        run(cmd);
+    } else {
+        /* Remote exists — update if .env/-u says something different */
+        char intended[AG_PATH] = {0};
+        if (flag_url[0])
+            snprintf(intended, sizeof(intended), "%s", flag_url);
+        else if (have_env_url)
+            snprintf(intended, sizeof(intended), "%s", env_url);
+
+        if (intended[0]) {
+            char cur[AG_PATH] = {0};
+            char q[512];
+            snprintf(q, sizeof(q), "git remote get-url %s", remote);
+            FILE *fp = popen(q, "r");
+            if (fp) {
+                if (fgets(cur, sizeof(cur), fp)) cur[strcspn(cur, "\r\n")] = 0;
+                pclose(fp);
+            }
+            if (cur[0] && strcmp(cur, intended) != 0) {
+                printf("Updating remote '%s': %s -> %s\n", remote, cur, intended);
+                char cmd[AG_CMD];
+                snprintf(cmd, sizeof(cmd),
+                         "git remote set-url %s \"%s\"", remote, intended);
+                run(cmd);
+            }
+        }
     }
 
     /* Read back configured remote URL */
@@ -547,11 +602,24 @@ int main(int argc, char *argv[]) {
 
     /* ── Ensure GitHub repo exists, offer to create if missing ───── */
     {
-        char host[128], owner[128], repo_name[128];
+        char host_p[128], owner[128], repo_name[128];
         if (cur_url[0]
-            && parse_git_url(cur_url, host, sizeof(host),
+            && parse_git_url(cur_url, host_p, sizeof(host_p),
                              owner, sizeof(owner), repo_name, sizeof(repo_name)) == 0
-            && strcmp(host, "github.com") == 0) {
+            && strcmp(host_p, "github.com") == 0) {
+
+            char repo_clean[128];
+            sanitize_repo_name(repo_name, repo_clean, sizeof(repo_clean));
+            if (strcmp(repo_name, repo_clean) != 0) {
+                fprintf(stderr,
+                    "warning: remote URL has invalid repo name '%s'\n", repo_name);
+                fprintf(stderr,
+                    "         GitHub needs '%s' — pass -u to fix, e.g.:\n", repo_clean);
+                fprintf(stderr,
+                    "           autogit -u git@github.com:%s/%s.git\n",
+                    owner, repo_clean);
+                snprintf(repo_name, sizeof(repo_name), "%s", repo_clean);
+            }
 
             int exists = github_repo_exists(owner, repo_name);
             if (exists == 0) {
@@ -567,30 +635,28 @@ int main(int argc, char *argv[]) {
                     return 1;
                 }
 
-                /* ── Visibility prompt (skipped with flags or -n) ── */
                 if (!noninteractive && !force_public && !force_private) {
-                    char vis_choice[32];
-                    char vlabel[96];
+                    char vis_choice[32], vlabel[96];
                     snprintf(vlabel, sizeof(vlabel),
                              "Visibility [private/public] (%s): ", visibility);
                     if (!prompt(vlabel, vis_choice, sizeof(vis_choice))) return 1;
                     if (vis_choice[0]) {
                         to_lower(vis_choice);
-                        if (!strcmp(vis_choice, "public") || !strcmp(vis_choice, "p")) {
+                        if (!strcmp(vis_choice, "public") || !strcmp(vis_choice, "p"))
                             strcpy(visibility, "public");
-                        } else if (!strcmp(vis_choice, "private") ||
-                                   !strcmp(vis_choice, "priv")) {
+                        else if (!strcmp(vis_choice, "private") ||
+                                 !strcmp(vis_choice, "priv"))
                             strcpy(visibility, "private");
-                        } else {
+                        else
                             fprintf(stderr, "Invalid choice '%s' — keeping %s\n",
                                     vis_choice, visibility);
-                        }
                     }
                 }
 
                 printf("Creating %s/%s as %s ...\n", owner, repo_name, visibility);
                 if (github_create_repo(owner, repo_name, visibility, noninteractive) != 0) {
-                    fprintf(stderr, "Failed to create %s/%s on GitHub.\n", owner, repo_name);
+                    fprintf(stderr, "Failed to create %s/%s on GitHub.\n",
+                            owner, repo_name);
                     return 1;
                 }
                 printf("Created https://github.com/%s/%s (%s)\n",
@@ -598,9 +664,8 @@ int main(int argc, char *argv[]) {
             } else if (exists == 1) {
                 if (force_public || force_private)
                     fprintf(stderr,
-                        "note: --public/--private only apply when creating a new repo; "
-                        "%s/%s already exists — change visibility in GitHub settings\n",
-                        owner, repo_name);
+                        "note: --public/--private only apply when creating; "
+                        "%s/%s already exists\n", owner, repo_name);
             } else if (exists == -1) {
                 fprintf(stderr,
                     "note: cannot verify %s/%s exists (no gh CLI, no GITHUB_TOKEN).\n"
@@ -608,14 +673,6 @@ int main(int argc, char *argv[]) {
                     owner, repo_name);
             }
         }
-    }
-
-    /* .env-vs-current warning */
-    if (have_env_url && cur_url[0] && strcmp(cur_url, env_url) != 0) {
-        fprintf(stderr, "note: .env GIT_REMOTE_URL differs from current remote\n");
-        fprintf(stderr, "      current: %s\n", cur_url);
-        fprintf(stderr, "      .env:    %s\n", env_url);
-        fprintf(stderr, "      pass -u \"%s\" to change it\n", env_url);
     }
 
     /* ── Description / commit message ────────────────────────────── */

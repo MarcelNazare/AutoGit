@@ -1,4 +1,4 @@
-# ── Toolchain (always gcc) ───────────────────────────────────────────
+# ── Toolchain ────────────────────────────────────────────────────────
 CC      := gcc
 CFLAGS  := -Wall -Wextra -O2 -std=c11
 LDFLAGS :=
@@ -18,7 +18,7 @@ BUILD  := build
 TARGET := $(BUILD)/autogit$(EXE)
 SRC    := autogit.c
 
-# ── Per-platform command fragments ───────────────────────────────────
+# ── Platform-specific commands ───────────────────────────────────────
 ifeq ($(WIN),1)
   winpath = $(subst /,\,$1)
   MKDIR_B = if not exist "$(call winpath,$(BUILD))" mkdir "$(call winpath,$(BUILD))"
@@ -38,31 +38,24 @@ BINDIR ?= $(PREFIX)/bin
 .DEFAULT_GOAL := all
 .PHONY: all check build run test clean install uninstall
 
-# ── Build ────────────────────────────────────────────────────────────
 all: check $(TARGET)
-
 check:
 	@$(CHECK_GCC)
-
 build: all
 
-# Single-shot compile+link — same as `gcc ... -o build/autogit.exe autogit.c`
 $(TARGET): $(SRC)
 	@$(MKDIR_B)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
-# ── Run ──────────────────────────────────────────────────────────────
 run: $(TARGET)
 	$(RUN_BIN) $(ARGS)
 
 test: $(TARGET)
 	$(RUN_BIN) -h
 
-# ── Clean ────────────────────────────────────────────────────────────
 clean:
 	@$(CLEAN_B)
 
-# ── Install ──────────────────────────────────────────────────────────
 ifeq ($(WIN),1)
 install: $(TARGET)
 	@echo Copy $(call winpath,$(TARGET)) into a folder on PATH, e.g.:

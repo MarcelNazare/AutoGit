@@ -1,8 +1,5 @@
 # ── Build output ──────────────────────────────────────────────────────
-# Everything the Makefile produces lands here — one entry covers it all.
 build/
-
-# Belt-and-braces for anyone compiling by hand with plain gcc:
 *.o
 *.obj
 *.exe
@@ -12,20 +9,14 @@ autogit
 autogit.exe
 
 # ── autogit temp files ────────────────────────────────────────────────
-# The tool writes its commit message to $TMPDIR / %TEMP% and deletes it,
-# but a crash mid-run can leave one behind in the repo if TMPDIR points
-# at the project.
 autogit_*.tmp
 
 # ── .env ──────────────────────────────────────────────────────────────
-# Holds only GIT_REMOTE_URL (a public git URL, not a secret), so it is
-# committed on purpose — cloning the repo means `autogit` just works.
-# Uncomment the next line if you ever put tokens or local overrides in
-# .env and don't want them pushed.
+# Holds only GIT_REMOTE_URL (public), so it's committed on purpose.
+# Uncomment if you add tokens or local overrides.
 # .env
 .env.local
 .env.*.local
-.env
 
 # ── Editor / IDE ──────────────────────────────────────────────────────
 .vscode/
@@ -47,12 +38,8 @@ desktop.ini
 # ── Logs / scratch ────────────────────────────────────────────────────
 *.log
 *.tmp
-!autogit_*.tmp
-/tmp/
 
 # ── Windows reserved-name leftovers ───────────────────────────────────
-# A file literally named NUL can appear if a POSIX shell ever interprets
-# `>NUL`. Git ignores it; this keeps it out of `git status` noise too.
 NUL
 CON
 PRN
